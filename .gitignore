@@ -1,0 +1,6 @@
+.env
+backups/
+cloudflared/
+*.sql.gz
+.DS_Store
+.claude/settings.local.json
