@@ -41,7 +41,7 @@ N8N_MCP_MANAGED_BY_ENV: ${N8N_MCP_MANAGED_BY_ENV:-true}
 
 ### 2. `.env.example`
 
-Document the MCP vars and optional SMTP for user invites:
+Document the MCP vars:
 
 ```
 # ---- MCP access (users connect MCP clients to their n8n account) ----
@@ -49,20 +49,11 @@ Document the MCP vars and optional SMTP for user invites:
 # Auth: per-user access token (Settings > Instance-level MCP > Access Token).
 N8N_MCP_ACCESS_ENABLED=true
 N8N_MCP_MANAGED_BY_ENV=true
-
-# ---- Optional SMTP (only needed to email user invites) ----
-# Leave blank to instead copy the invite link n8n shows in the invite dialog.
-N8N_SMTP_HOST=
-N8N_SMTP_PORT=587
-N8N_SMTP_USER=
-N8N_SMTP_PASS=
-N8N_EMAIL_MODE=smtp
-N8N_SMTP_SENDER=
 ```
 
 ### 3. `scripts/init-env.sh`
 
-No change. The script already copies `.env.example` verbatim (substituting only the generated secrets), so the `N8N_MCP_ACCESS_ENABLED=true` / `N8N_MCP_MANAGED_BY_ENV=true` values written into `.env.example` flow into `.env` automatically on `make init-env`. Additionally, because `docker-compose.yml` uses `${VAR:-true}` fallbacks, an existing `.env` lacking these keys still enables MCP — no forced regeneration required.
+No change. The script already copies `.env.example` verbatim (substituting only the generated secrets), so the `N8N_MCP_ACCESS_ENABLED=true` / `N8N_MCP_MANAGED_BY_ENV=true` values written into `.env.example` flow into `.env` automatically on `make init-env`. Additionally, because `docker-compose.yml` uses `${VAR:-true}` fallbacks, an existing `.env` lacking these keys still enables MCP — no forced regeneration required. No SMTP configuration is added.
 
 ### 4. `cloudflared/config.yml`
 
@@ -71,7 +62,7 @@ No change. The existing catch-all `service: http://n8n:5678` for the hostname se
 ### 5. `README.md`
 
 Add a `## MCP access for users` section:
-- Owner step: MCP is enabled by the stack env (no manual toggle needed). To invite users: Settings → Users; with SMTP configured n8n emails invites, otherwise copy the invite link from the invite dialog.
+- Owner step: MCP is enabled by the stack env (no manual toggle needed). To invite users: Settings → Users → invite; n8n shows an invite link (no SMTP configured) for the owner to send to the user manually.
 - User step 1: log in → Settings → Instance-level MCP → Access Token tab → copy the auto-generated token (shown once, redacted after; rotate here if lost).
 - User step 2: expose workflows as tools — open a workflow → `...` → Settings → toggle "Available in MCP", or bulk-enable a project/folder via Options → Manage MCP access → Enable MCP. Note: n8n does not auto-expose all workflows.
 - User step 3: configure the MCP client. Provide three snippets (Claude Desktop via `supergateway`, Claude Code CLI, Cursor/other streamable-HTTP clients) using `https://${DOMAIN}/mcp-server/http` and `Authorization: Bearer <USER_TOKEN>`.
@@ -108,7 +99,7 @@ Add a `## MCP access for users` section:
 ## Files touched
 
 - `docker-compose.yml` — add 2 MCP env vars to n8n service.
-- `.env.example` — MCP vars + optional SMTP block.
+- `.env.example` — MCP vars.
 - `README.md` — new MCP section + security note.
 - `scripts/init-env.sh` — no change (MCP defaults flow through via `.env.example` copy).
 - `cloudflared/config.yml` — no change (documented as unchanged).
