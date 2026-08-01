@@ -178,4 +178,4 @@ Pin a specific version by editing `docker-compose.yml` (`image: n8nio/n8n:<versi
 - `.env` and `cloudflared/` are gitignored — both contain secrets. Never commit them.
 - Rotate the Cloudflare API token if it's ever leaked (dash.cloudflare.com → My Profile → API Tokens → Roll).
 - The tunnel hides your host's public IP; no inbound ports need to be open.
-- The `/mcp-server/http` endpoint is public via the tunnel but token-gated per user: only invited users can obtain a token. To separately disable the n8n Public REST API (`/api/v1`) if you don't use it, set `N8N_PUBLIC_API_DISABLED=true` in `.env` and `make restart`.
+- The `/mcp-server/http` endpoint is public via the tunnel but token-gated per user: only invited users can obtain a token. To separately disable the n8n Public REST API (`/api/v1`) if you don't use it, add `N8N_PUBLIC_API_DISABLED: true` to the n8n service environment in `docker-compose.yml`, then `make up`.
