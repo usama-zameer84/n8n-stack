@@ -53,6 +53,68 @@ make down              # stop, keep volumes
 make status            # show container status
 ```
 
+## MCP access for users
+
+Instance-level MCP is enabled by the stack (`N8N_MCP_ACCESS_ENABLED=true` in `.env`, applied by `docker-compose.yml`). The n8n remote MCP server exposes workflows as MCP tools at:
+
+```
+https://${DOMAIN}/mcp-server/http
+```
+
+Authentication is a **per-user access token** (not the n8n Public API key).
+
+### Owner: invite users
+
+1. Log in as owner → **Settings → Users → Invite**.
+2. n8n shows an invite link (no SMTP is configured). Copy it and send it to the user out-of-band.
+3. The user follows the link, sets a password, and gets their own workflows/credentials.
+
+To disable MCP for the whole instance, set `N8N_MCP_ACCESS_ENABLED=false` in `.env` and `make restart`. (The on/off toggle in the UI is locked because `N8N_MCP_MANAGED_BY_ENV=true`.)
+
+### User: generate your access token
+
+1. Log in at `https://${DOMAIN}` → **Settings → Instance-level MCP → Access Token** tab.
+2. Copy the auto-generated token immediately. It is shown **once** and redacted afterward. If you lose it, generate a new one here (the old one is revoked).
+
+### User: expose workflows as MCP tools
+
+n8n does **not** auto-expose all workflows. Enable the ones you want available:
+
+- **Per workflow**: open the workflow → `...` menu → **Settings** → toggle **Available in MCP**.
+- **Per project/folder** (bulk): project **Options** menu → **Manage MCP access** → **Enable MCP**.
+
+You only see workflows you already have access to.
+
+### User: connect an MCP client
+
+All clients use the same endpoint and `Authorization: Bearer <YOUR_TOKEN>` header. Replace `<YOUR_TOKEN>` with your access token.
+
+**Claude Desktop** (via the `supergateway` streamable-HTTP bridge):
+
+```json
+{
+  "mcpServers": {
+    "n8n-mcp": {
+      "command": "npx",
+      "args": [
+        "-y", "supergateway",
+        "--streamableHttp", "https://${DOMAIN}/mcp-server/http",
+        "--header", "Authorization:Bearer <YOUR_TOKEN>"
+      ]
+    }
+  }
+}
+```
+
+**Claude Code**:
+
+```bash
+claude mcp add --transport http n8n-mcp https://${DOMAIN}/mcp-server/http \
+  --header "Authorization: Bearer <YOUR_TOKEN>"
+```
+
+**Cursor / other streamable-HTTP clients**: set the server URL to `https://${DOMAIN}/mcp-server/http` and add the header `Authorization: Bearer <YOUR_TOKEN>`.
+
 ## Backup & restore
 
 `make backup` writes `backups/n8n-YYYYMMDD-HHMMSS.sql.gz` and prunes to the last `BACKUP_KEEP` (default 30) files.
@@ -116,3 +178,4 @@ Pin a specific version by editing `docker-compose.yml` (`image: n8nio/n8n:<versi
 - `.env` and `cloudflared/` are gitignored — both contain secrets. Never commit them.
 - Rotate the Cloudflare API token if it's ever leaked (dash.cloudflare.com → My Profile → API Tokens → Roll).
 - The tunnel hides your host's public IP; no inbound ports need to be open.
+- The `/mcp-server/http` endpoint is public via the tunnel but token-gated per user: only invited users can obtain a token. To separately disable the n8n Public REST API (`/api/v1`) if you don't use it, set `N8N_PUBLIC_API_DISABLED=true` in `.env` and `make restart`.
