@@ -126,6 +126,26 @@ gunzip -c backups/n8n-<stamp>.sql.gz | \
   docker compose exec -T postgres psql -U "$$(grep POSTGRES_USER .env | cut -d= -f2)" -d "$$(grep POSTGRES_DB .env | cut -d= -f2)"
 ```
 
+## Connecting workflows to Postgres
+
+The stack runs two databases inside the `postgres` container:
+
+- `n8n` — n8n's internal state (executions, users, stored credentials). Don't write workflow data here.
+- `workflows` — for the Postgres node in your workflows. Created by `scripts/init-db.sh` on first init, owned by the `workflow_app` user, isolated from the `n8n` database (no `CONNECT` on each other's DB).
+
+When you add a **Postgres** credential in n8n, the host must be the Docker service name, not `localhost`:
+
+| Field | Value |
+|---|---|
+| Host | `postgres` |
+| Port | `5432` |
+| Database | `workflows` |
+| User | `workflow_app` |
+| Password | `WORKFLOW_DB_PASSWORD` from `.env` |
+| SSL | off (internal network) |
+
+Typing `localhost` here gives "Connection refused" — the n8n container has no Postgres on its own loopback. To reach Postgres from the host instead, add `ports: ["127.0.0.1:5432:5432"]` to the `postgres` service in `docker-compose.yml`.
+
 ## Upgrading n8n
 
 ```bash
