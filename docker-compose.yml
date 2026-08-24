@@ -47,6 +47,11 @@ services:
       N8N_MCP_ACCESS_ENABLED: ${N8N_MCP_ACCESS_ENABLED:-true}
       N8N_MCP_MANAGED_BY_ENV: ${N8N_MCP_MANAGED_BY_ENV:-true}
       N8N_PERSONALIZATION_ENABLED: false
+      # ---- external task runners (official n8n architecture) ----
+      N8N_RUNNERS_MODE: external
+      N8N_RUNNERS_AUTH_TOKEN: ${RUNNER_TOKEN}
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+      N8N_NATIVE_PYTHON_RUNNER: "true"
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
@@ -61,6 +66,23 @@ services:
     command: tunnel run
     volumes:
       - ./cloudflared:/etc/cloudflared:ro
+    networks:
+      - n8n-net
+
+  task-runners:
+    build: ../workflows/workflows/drug-prep-docking/runner-official
+    image: n8n-runners-science:2.32.7
+    container_name: n8n-task-runners
+    restart: unless-stopped
+    environment:
+      N8N_RUNNERS_AUTH_TOKEN: ${RUNNER_TOKEN}
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n-app:5679
+    volumes:
+      # artifacts: put receptor PDBs in ~/md_project/data/input/
+      # reports appear in ~/md_project/data/output/reports/
+      - ${HOME}/md_project:/md_project
+    depends_on:
+      - n8n
     networks:
       - n8n-net
 
