@@ -9,6 +9,7 @@ Single-node n8n deployment with Postgres persistence, exposed to the internet vi
 | `n8n` | `n8nio/n8n:latest` | Workflow automation UI + executor |
 | `postgres` | `postgres:16-alpine` | Stores workflows, credentials, executions |
 | `cloudflared` | `cloudflare/cloudflared:latest` | Outbound tunnel to Cloudflare edge; terminates public TLS at edge |
+| `n8n-restore` | `alpine:3.20` | One-shot: restores `n8n_data` from backup on fresh init only |
 
 No host ports are published. n8n (5678) and Postgres (5432) are internal to the `n8n-net` bridge network; cloudflared proxies inbound requests from the tunnel to `http://n8n:5678`.
 
@@ -47,7 +48,9 @@ make logs              # all services
 make logs-n8n          # n8n only
 make logs-tunnel       # cloudflared connection log
 make psql              # interactive Postgres shell
-make backup            # pg_dump to backups/ (gzipped, keeps last 30)
+make backup            # snapshot n8n + workflows DBs and n8n_data to backups/
+make backup-list       # list backups
+make backup-verify     # integrity-check the newest backup
 make upgrade           # backup + pull + restart
 make down              # stop, keep volumes
 make status            # show container status
@@ -115,15 +118,46 @@ claude mcp add --transport http n8n-mcp https://${DOMAIN}/mcp-server/http \
 
 **Cursor / other streamable-HTTP clients**: set the server URL to `https://${DOMAIN}/mcp-server/http` and add the header `Authorization: Bearer <YOUR_TOKEN>`.
 
-## Backup & restore
+## Backup & recovery
 
-`make backup` writes `backups/n8n-YYYYMMDD-HHMMSS.sql.gz` and prunes to the last `BACKUP_KEEP` (default 30) files.
+`make backup` snapshots the full stack state into `backups/` as a timestamped set (kept in sync and pruned together to the last `BACKUP_KEEP`, default 30):
 
-Restore (run from repo root):
+- `n8n-<ts>.sql.gz` — n8n's internal Postgres DB (workflows, executions, users, stored credentials)
+- `workflows-<ts>.sql.gz` — the separate workflow-data DB (Postgres node data)
+- `n8n-data-<ts>.tar.gz` — `/home/node/.n8n` from the n8n container (logs, uploads, local config)
+
+### Seamless restore on volume loss
+
+Restore is **automatic on fresh init** — no manual step needed. If a Docker volume is removed (or you move to a new host with the `backups/` folder in place), `make up` brings the stack back with data:
+
+- `pg_data` volume empty → the Postgres entrypoint runs `scripts/20-restore.sh`, which loads the newest `n8n-*.sql.gz` + matching `workflows-*.sql.gz` before n8n connects. If no backup exists, it exits cleanly and you get a fresh install.
+- `n8n_data` volume empty → the one-shot `n8n-restore` container extracts the newest `n8n-data-*.tar.gz` into the volume before n8n starts. If the volume already has data, or no backup exists, it does nothing.
+
+So the recovery flow is simply:
 
 ```bash
-gunzip -c backups/n8n-<stamp>.sql.gz | \
-  docker compose exec -T postgres psql -U "$$(grep POSTGRES_USER .env | cut -d= -f2)" -d "$$(grep POSTGRES_DB .env | cut -d= -f2)"
+make backup                 # take a snapshot before anything drastic
+docker compose down -v      # destroys volumes
+make up                     # Postgres + n8n-restore auto-restore the newest snapshot, then n8n starts
+```
+
+On normal restarts (volumes intact) neither restore path runs — the entrypoint init scripts only fire on an empty data directory, and `n8n-restore` only acts on an empty volume.
+
+### Verifying a backup
+
+```bash
+make backup-verify          # gzip integrity + pg_dump header check on the newest snapshot
+make backup-list            # list what's in backups/
+```
+
+### Manual restore (advanced)
+
+Only needed if you want to restore a *specific* snapshot onto a *running* database (destructive — overwrites current data):
+
+```bash
+stamp=20260829-143000
+docker compose exec -T postgres psql -U "$$(grep POSTGRES_USER .env | cut -d= -f2)" -d "$$(grep POSTGRES_DB .env | cut -d= -f2)" < <(gunzip -c backups/n8n-$stamp.sql.gz)
+docker compose exec -T postgres psql -U "$$(grep POSTGRES_USER .env | cut -d= -f2)" -d workflows < <(gunzip -c backups/workflows-$stamp.sql.gz)
 ```
 
 ## Connecting workflows to Postgres
@@ -187,10 +221,12 @@ Pin a specific version by editing `docker-compose.yml` (`image: n8nio/n8n:<versi
 │   └── config.yml        # ingress rules
 ├── scripts/
 │   ├── init-env.sh       # generates Postgres/n8n secrets -> .env
-│   ├── init-db.sh        # creates non-root Postgres role on first init
+│   ├── init-db.sh        # creates non-root Postgres role + workflows DB on first init
+│   ├── 20-restore.sh     # auto-restores newest backup on fresh Postgres init
 │   ├── tunnel-setup.sh   # creates tunnel + DNS, writes cloudflared/ files
-│   └── backup.sh         # pg_dump wrapper
-└── backups/              # created on first backup
+│   ├── backup.sh         # snapshots both DBs + n8n_data to backups/
+│   └── backup-verify.sh  # integrity-checks the newest backup
+└── backups/              # created on first backup (gitignored)
 ```
 
 ## Security notes
