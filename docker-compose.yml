@@ -3,15 +3,45 @@ services:
     image: postgres:16-alpine
     container_name: n8n-postgres
     restart: unless-stopped
+    # Cap RSS at 192MB; reserve 128MB so it never gets starved under pressure.
+    # shared_buffers=96MB (set below) + per-connection overhead fits comfortably.
+    mem_limit: 192m
+    mem_reservation: 128m
+    # Strip Postgres features we don't use to shrink RSS (no PL/Python, no JIT).
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=96MB"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "maintenance_work_mem=32MB"
+      - "-c"
+      - "effective_cache_size=256MB"
+      - "-c"
+      - "max_connections=20"
+      - "-c"
+      - "wal_buffers=4MB"
+      - "-c"
+      - "jit=off"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_NON_ROOT_USER: ${POSTGRES_NON_ROOT_USER}
       POSTGRES_NON_ROOT_PASSWORD: ${POSTGRES_NON_ROOT_PASSWORD}
+      # Required by init-db.sh (10-init-db.sh) and 20-restore.sh so the
+      # workflows DB + its user actually get created and restored.
+      WORKFLOW_DB: ${WORKFLOW_DB}
+      WORKFLOW_DB_USER: ${WORKFLOW_DB_USER}
+      WORKFLOW_DB_PASSWORD: ${WORKFLOW_DB_PASSWORD}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      # 10- prefix keeps init-db.sh ahead of 20-restore.sh in entrypoint order.
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/10-init-db.sh:ro
+      - ./scripts/20-restore.sh:/docker-entrypoint-initdb.d/20-restore.sh:ro
+      # Read-only backup dir so 20-restore.sh can find dumps on fresh init.
+      - ./backups:/backups:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -24,10 +54,22 @@ services:
     image: n8nio/n8n:latest
     container_name: n8n-app
     restart: unless-stopped
+    # Cap n8n RSS at 640MB. Node's V8 heap is the dominant cost; pinning
+    # --max-old-space-size=384 (see env below) keeps GC headroom predictable.
+    # Reserve 256MB so n8n is not paged out under backup/pg_dump pressure.
+    mem_limit: 640m
+    mem_reservation: 256m
     depends_on:
       postgres:
         condition: service_healthy
+      n8n-restore:
+        condition: service_completed_successfully
     environment:
+      # Cap V8 heap. With 640MB mem_limit, leaving 256MB for non-heap (JS stack,
+      # buffers, native modules) avoids the OOM-killer taking down n8n when a
+      # Code node holds large objects. 256 was too tight — startup alone hits
+      # 247MB and crashes before serving.
+      NODE_OPTIONS: "--max-old-space-size=384"
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
@@ -52,6 +94,9 @@ services:
       N8N_RUNNERS_AUTH_TOKEN: ${RUNNER_TOKEN}
       N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
       N8N_NATIVE_PYTHON_RUNNER: "true"
+      # Limit concurrent Code-node executions so a burst doesn't fork 10 Python
+      # venvs and blow the memory budget. Default is 5; pin to 2 for this box.
+      N8N_RUNNERS_MAX_CONCURRENCY: "2"
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
@@ -61,6 +106,9 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: n8n-cloudflared
     restart: unless-stopped
+    # Go binary, very lean. Hard-cap so a reconnect-storm can't starve the rest.
+    mem_limit: 64m
+    mem_reservation: 32m
     depends_on:
       - n8n
     command: tunnel run
@@ -69,20 +117,136 @@ services:
     networks:
       - n8n-net
 
+  # External task runner for n8n Code nodes (JavaScript + Python).
+  # Built locally from ./task-runners (extends n8nio/runners). This is what
+  # services Code-node execution when N8N_RUNNERS_MODE=external on n8n —
+  # without it, every Code node times out after 60s ("task not matched").
+  # Add Python libraries via task-runners/requirements.txt, then `make build-runners`.
   task-runners:
-    build: ../workflows/workflows/drug-prep-docking/runner-official
-    image: n8n-runners-science:2.32.7
+    build: ./task-runners
+    image: n8n-runners-python:local
     container_name: n8n-task-runners
     restart: unless-stopped
+    # Python venv + Node broker. Cap at 256MB; reserve 128MB so a single
+    # large Code-node execution has headroom without evicting n8n.
+    mem_limit: 256m
+    mem_reservation: 128m
     environment:
+      # Same V8 cap as n8n — the JS-side runner broker is Node.
+      NODE_OPTIONS: "--max-old-space-size=128"
       N8N_RUNNERS_AUTH_TOKEN: ${RUNNER_TOKEN}
       N8N_RUNNERS_TASK_BROKER_URI: http://n8n-app:5679
+      # Let Python Code nodes import any package installed in the runner venv
+      # (see task-runners/requirements.txt) without per-module allowlisting.
+      N8N_RUNNERS_EXTERNAL_ALLOW: "*"
+      N8N_RUNNERS_STDLIB_ALLOW: "*"
+      N8N_RUNNERS_ALLOW_TRANSITIVE_IMPORTS: "true"
     volumes:
-      # artifacts: put receptor PDBs in ~/md_project/data/input/
-      # reports appear in ~/md_project/data/output/reports/
+      # Optional: mount your project dir so Code nodes can read/write files
+      # (e.g. receptor PDBs in ~/md_project/data/input/, reports in .../output/reports/).
+      # Remove this mount if your Code nodes don't touch the host filesystem.
       - ${HOME}/md_project:/md_project
     depends_on:
-      - n8n
+      n8n:
+        condition: service_started
+    networks:
+      - n8n-net
+
+  # One-shot init container: if the n8n_data volume is empty (fresh or removed)
+  # and a matching n8n-data-*.tar.gz snapshot exists in ./backups, extract it
+  # before n8n starts. Runs to completion; n8n waits on it above.
+  n8n-restore:
+    image: alpine:3.20
+    container_name: n8n-restore
+    restart: "no"
+    # Brief lifetime — only the restore tar needs to fit. Hard cap so a huge
+    # backup (14GB+ on disk) can't OOM the VM during extraction.
+    mem_limit: 128m
+    mem_reservation: 64m
+    volumes:
+      - n8n_data:/data
+      - ./backups:/backups:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -n "$$(ls -A /data 2>/dev/null)" ]; then
+          echo "[n8n-restore] n8n_data volume not empty — nothing to do."
+          exit 0
+        fi
+        newest=$$(ls -1 /backups/n8n-data-*.tar.gz 2>/dev/null | sort | tail -n 1 || true)
+        if [ -z "$$newest" ]; then
+          echo "[n8n-restore] volume empty and no n8n-data-*.tar.gz found — fresh install."
+          exit 0
+        fi
+        echo "[n8n-restore] volume empty — restoring $$(basename "$$newest")"
+        tar xzf "$$newest" -C /data
+        echo "[n8n-restore] done."
+
+  # Hourly backup sidecar. Runs entirely inside Docker (which already has
+  # host-file access via the existing bind mounts), so it needs no macOS
+  # Full Disk Access — unlike a host LaunchAgent, which TCC blocks from
+  # ~/Desktop. Writes the same ./backups snapshots as scripts/backup.sh,
+  # so scripts/20-restore.sh + n8n-restore consume them unchanged.
+  backup:
+    # postgres:16-alpine is kept because the backup script shells out to
+    # pg_dump, which only ships in the postgres/postgresql-client images.
+    # Switching to plain alpine would force an apk add postgresql-client on
+    # every start (worse cold-start cost than the ~30MB idle RSS difference).
+    image: postgres:16-alpine
+    container_name: n8n-backup
+    restart: unless-stopped
+    # Cap at 160MB so a tar of n8n_data (hundreds of MB compressed) plus two
+    # concurrent pg_dumps can't push the VM past 1GB. 64MB reservation is
+    # enough for the cron daemon + idle pg client.
+    mem_limit: 160m
+    mem_reservation: 64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n:
+        condition: service_started
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      WORKFLOW_DB: ${WORKFLOW_DB}
+      BACKUP_KEEP: ${BACKUP_KEEP:-30}
+      # 5-field cron, evaluated inside the container by busybox crond.
+      # Default: top of every hour. Override via .env if needed.
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 * * * *}
+      # Set to "true" to run one backup immediately on container start.
+      # Default false: on a 1GB box, an immediate full dump + tar right after
+      # `docker compose up` is what tips the VM into OOM. Leave it off; the
+      # first cron tick (top of the next hour) will produce the first snapshot.
+      BACKUP_ON_START: ${BACKUP_ON_START:-false}
+    volumes:
+      # Read the n8n_data volume to tar it (same content as /home/node/.n8n).
+      - n8n_data:/n8n-data:ro
+      # Write snapshots here — same ./backups the restore path reads from.
+      - ./backups:/backups:rw
+      # The backup script itself (mounted read-only, invoked by crond).
+      - ./scripts/backup-cron.sh:/usr/local/bin/backup.sh:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        # Materialise the creds/env crond jobs can't inherit reliably.
+        printf 'POSTGRES_HOST=%s\nPOSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=%s\nWORKFLOW_DB=%s\nBACKUP_KEEP=%s\n' \
+          "$${POSTGRES_HOST}" "$${POSTGRES_USER}" "$${POSTGRES_PASSWORD}" "$${POSTGRES_DB}" "$${WORKFLOW_DB}" "$${BACKUP_KEEP}" \
+          > /etc/backup.env
+        chmod 600 /etc/backup.env
+        mkdir -p /etc/crontabs
+        echo "$${BACKUP_SCHEDULE} /usr/local/bin/backup.sh >> /backups/.backup-cron.log 2>&1" > /etc/crontabs/root
+        # Optional one-shot run on start (off by default on this 1GB box).
+        if [ "$${BACKUP_ON_START}" = "true" ]; then
+          /usr/local/bin/backup.sh >> /backups/.backup-cron.log 2>&1 || true
+        fi
+        # Foreground crond; -c sets the crontab spool dir, -l 6 logs job runs.
+        exec crond -f -c /etc/crontabs -l 6
     networks:
       - n8n-net
 
