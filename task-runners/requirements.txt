@@ -1,0 +1,22 @@
+# Python libraries available to n8n Python Code nodes (mode: python).
+#
+# These are pip-installed into the runner's virtualenv at build time, so any
+# `import <pkg>` in a Code node resolves to what's listed here.
+#
+# Add one package per line (optionally pinned with ==). Then rebuild:
+#
+#     make build-runners
+#
+# docker-compose.yml sets N8N_RUNNERS_EXTERNAL_ALLOW=* so anything installed
+# here is importable without per-module allowlisting.
+#
+# Examples (uncomment to include):
+# numpy
+# pandas
+# scipy
+# matplotlib
+# scikit-learn
+# rdkit
+# biopython
+# requests
+# Pillow
